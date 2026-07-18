@@ -7,6 +7,8 @@
 import asyncio
 import os
 import re
+import random
+import string
 
 import httpx
 
@@ -50,6 +52,13 @@ _client: httpx.AsyncClient | None = None
 _poll_task: asyncio.Task | None = None
 _running = False
 _pending: dict = {}   # chat_id -> {"action": "wizard", "step": "...", "data": {...}}
+
+# ── تولید نام رندوم برای کانفیگ ───────────────────────────────────────────────
+def _generate_random_name():
+    """نام رندوم برای کانفیگ (مثلاً: Phoenix-7X9k, Alpha-2B4m)"""
+    adjectives = ["Phoenix", "Tiger", "Falcon", "Dragon", "Storm", "Shadow", "Blaze", "Swift", "Cipher", "Quantum"]
+    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"{random.choice(adjectives)}-{suffix}"
 
 # ── Config creation wizard ────────────────────────────────────────────────────
 # مراحل ساخت کانفیگ جدید، دقیقاً هم‌راستا با فیلدهایی که پنل وب موقع ساخت کاربر می‌گیره:
@@ -176,6 +185,7 @@ def _link_detail_kb(uid: str, active: bool):
     return {"inline_keyboard": [
         [{"text": "🔗 نمایش لینک اتصال", "callback_data": f"link:{uid}"}],
         [{"text": "🗂 گروه ساب (لینک حرفه‌ای)", "callback_data": f"cfggroup:{uid}"}],
+        [{"text": "⚙️ ویرایش پیشرفته", "callback_data": f"advedit:{uid}"}],
         [{"text": ("⛔ غیرفعال‌سازی" if active else "✅ فعال‌سازی"), "callback_data": f"toggle:{uid}"}],
         [{"text": "🗑 حذف کانفیگ", "callback_data": f"del:{uid}"}],
         [{"text": "⬅ بازگشت به لیست", "callback_data": "list:0"}],
@@ -187,9 +197,16 @@ def _confirm_delete_kb(uid: str):
          {"text": "❌ انصراف", "callback_data": f"view:{uid}"}],
     ]}
 
-# ── Wizard keyboards ─────────────────────────────────────────────────────────
+# ── Wizard keyboards (ساخت کانفیگ) ─────────────────────────────────────────────
 def _wizard_cancel_kb():
     return {"inline_keyboard": [[{"text": "❌ انصراف", "callback_data": "w:cancel"}]]}
+
+def _wizard_label_kb():
+    """دکمه نام رندوم برای اسم کانفیگ"""
+    return {"inline_keyboard": [
+        [{"text": "🎲 نام رندوم", "callback_data": "w:randomname"}],
+        [{"text": "❌ انصراف", "callback_data": "w:cancel"}],
+    ]}
 
 def _wizard_protocol_kb():
     rows = [[{"text": _protocol_label(p), "callback_data": f"w:proto:{p}"}] for p in PROTOCOLS]
@@ -233,11 +250,25 @@ def _wizard_confirm_kb():
         [{"text": "❌ انصراف", "callback_data": "w:cancel"}],
     ]}
 
+# ── Keyboards ویرایش پیشرفته ──────────────────────────────────────────────────
+def _advedit_menu_kb(uid: str):
+    """منوی ویرایش پیشرفته برای حجم، روز انقضا، حد یوزر"""
+    return {"inline_keyboard": [
+        [{"text": "📦 تغییر حجم", "callback_data": f"ae:volume:{uid}"}],
+        [{"text": "📅 تغییر تاریخ انقضا", "callback_data": f"ae:days:{uid}"}],
+        [{"text": "👥 تغییر حد یوزر/آی‌پی", "callback_data": f"ae:iplimit:{uid}"}],
+        [{"text": "⬅ بازگشت", "callback_data": f"view:{uid}"}],
+    ]}
+
+def _advedit_cancel_kb(uid: str):
+    """دکمه انصراف برای ویرایش پیشرفته"""
+    return {"inline_keyboard": [[{"text": "⬅ بازگشت", "callback_data": f"view:{uid}"}]]}
+
 def _wizard_prompt(step: str, data: dict) -> str:
     n = WIZARD_STEPS.index(step) + 1 if step in WIZARD_STEPS else len(WIZARD_STEPS)
     head = f"🧩 ساخت کانفیگ جدید — مرحله {n}/{len(WIZARD_STEPS)}\n\n"
     if step == "label":
-        return head + "✏️ اسم/برچسب کانفیگ رو بفرست:"
+        return head + "✏️ اسم/برچسب کانفیگ رو بفرست یا دکمه رندوم رو بزن:"
     if step == "protocol":
         return head + "🌐 پروتکل رو از دکمه‌های زیر انتخاب کن:"
     if step == "fingerprint":
@@ -434,6 +465,54 @@ async def _handle_message(msg: dict):
         else:
             await _send(chat_id, f"✅ گروه ساخته شد.\n\n{_format_sub_detail(sid, s)}", _sub_detail_kb(sid))
         return
+
+    # ── ویرایش پیشرفته: تغییر حجم/روز/یوزر ──────────────────────────────────────
+    if pending and pending.get("action") == "advedit":
+        uid = pending.get("uid")
+        ae_step = pending.get("step")
+        if uid not in LINKS:
+            _pending.pop(chat_id, None)
+            await _send(chat_id, "این کانفیگ دیگه وجود نداره.", _main_menu_kb())
+            return
+        l = LINKS[uid]
+        
+        if ae_step == "volume" and text:
+            parsed = _parse_volume_text(text)
+            if parsed is None:
+                await _send(chat_id, "❗️ فرمت درست نیست. مثلاً بفرست: <code>10GB</code> یا <code>500MB</code> یا <code>0</code> برای نامحدود")
+                return
+            # اپدیت حجم
+            l["limit_bytes"] = parsed
+            _pending.pop(chat_id, None)
+            await _send(chat_id, f"✅ حجم تغیر کرد به {fmt_bytes(parsed) if parsed else 'نامحدود'}.\n\n{_format_detail(uid, l)}", _link_detail_kb(uid, l["active"]))
+            return
+
+        if ae_step == "days" and text:
+            n = _parse_nonneg_int(text)
+            if n is None:
+                await _send(chat_id, "❗️ یه عدد صحیح بفرست (تعداد روز) یا 0 برای بدون انقضا:")
+                return
+            # اپدیت تاریخ انقضا
+            if n > 0:
+                l["expires_at"] = (datetime.now() + timedelta(days=n)).isoformat()
+            else:
+                l["expires_at"] = None
+            _pending.pop(chat_id, None)
+            exp_txt = l.get("expires_at", "").split("T")[0] if l.get("expires_at") else "بدون انقضا"
+            await _send(chat_id, f"✅ تاریخ انقضا تغیر کرد به {exp_txt}.\n\n{_format_detail(uid, l)}", _link_detail_kb(uid, l["active"]))
+            return
+
+        if ae_step == "iplimit" and text:
+            n = _parse_nonneg_int(text)
+            if n is None:
+                await _send(chat_id, "❗️ یه عدد صحیح بفرست یا 0 برای نامحدود:")
+                return
+            # اپدیت حد یوزر
+            l["ip_limit"] = n
+            _pending.pop(chat_id, None)
+            limit_txt = n or "نامحدود"
+            await _send(chat_id, f"✅ حد یوزر/آی‌پی تغیر کرد به {limit_txt}.\n\n{_format_detail(uid, l)}", _link_detail_kb(uid, l["active"]))
+            return
 
     if pending and pending.get("action") == "wizard" and text:
         step = pending["step"]
@@ -650,10 +729,62 @@ async def _handle_callback(cb: dict):
         await _edit(chat_id, message_id, "✏️ اسم گروه جدید رو بفرست؛ بعد از ساخته شدن، همین کانفیگ خودکار داخلش قرار می‌گیره:", _wizard_cancel_kb())
         return
 
+    # ── ویرایش پیشرفته: تغییر حجم/روز/یوزر ──────────────────────────────────────
+    if data.startswith("advedit:"):
+        uid = data.split(":", 1)[1]
+        if uid not in LINKS:
+            await _edit(chat_id, message_id, "این کانفیگ دیگه وجود نداره.", _main_menu_kb())
+            return
+        _pending[chat_id] = {"action": "advedit", "uid": uid, "step": None}
+        await _edit(chat_id, message_id, "⚙️ چی می‌خوای تغیر بدی؟", _advedit_menu_kb(uid))
+        return
+
+    if data.startswith("ae:volume:"):
+        uid = data.split(":", 2)[2]
+        if uid not in LINKS:
+            await _edit(chat_id, message_id, "این کانفیگ دیگه وجود نداره.", _main_menu_kb())
+            return
+        _pending[chat_id] = {"action": "advedit", "uid": uid, "step": "volume"}
+        l = LINKS.get(uid, {})
+        current = fmt_bytes(l.get("limit_bytes", 0)) if l.get("limit_bytes") else "نامحدود"
+        await _edit(chat_id, message_id, f"📦 حجم فعلی: {current}\n\nحجم جدید رو بفرست، مثلاً <code>10GB</code> یا <code>500MB</code> یا <code>0</code> برای نامحدود:", _advedit_cancel_kb(uid))
+        return
+
+    if data.startswith("ae:days:"):
+        uid = data.split(":", 2)[2]
+        if uid not in LINKS:
+            await _edit(chat_id, message_id, "این کانفیگ دیگه وجود نداره.", _main_menu_kb())
+            return
+        _pending[chat_id] = {"action": "advedit", "uid": uid, "step": "days"}
+        l = LINKS.get(uid, {})
+        current = l.get("expires_at", "").split("T")[0] if l.get("expires_at") else "بدون انقضا"
+        await _edit(chat_id, message_id, f"📅 تاریخ انقضا فعلی: {current}\n\nتعداد روزهای جدید رو بفرست یا <code>0</code> برای بدون انقضا:", _advedit_cancel_kb(uid))
+        return
+
+    if data.startswith("ae:iplimit:"):
+        uid = data.split(":", 2)[2]
+        if uid not in LINKS:
+            await _edit(chat_id, message_id, "این کانفیگ دیگه وجود نداره.", _main_menu_kb())
+            return
+        _pending[chat_id] = {"action": "advedit", "uid": uid, "step": "iplimit"}
+        l = LINKS.get(uid, {})
+        current = l.get("ip_limit", 0) or "نامحدود"
+        await _edit(chat_id, message_id, f"👥 حد یوزر/آی‌پی فعلی: {current}\n\nحد جدید رو بفرست یا <code>0</code> برای نامحدود:", _advedit_cancel_kb(uid))
+        return
+
     if data == "newcfg":
         _pending[chat_id] = {"action": "wizard", "step": "label", "data": {}}
-        await _edit(chat_id, message_id, _wizard_prompt("label", {}), _wizard_cancel_kb())
+        await _edit(chat_id, message_id, _wizard_prompt("label", {}), _wizard_label_kb())
         return
+
+    if data == "w:randomname":
+        pending = _pending.get(chat_id)
+        if pending and pending.get("action") == "wizard" and pending.get("step") == "label":
+            name = _generate_random_name()
+            pending["data"]["label"] = name
+            pending["step"] = "protocol"
+            await _edit(chat_id, message_id, f"✅ نام تولید شد: <b>{name}</b>\n\n{_wizard_prompt('protocol', pending['data'])}", _wizard_protocol_kb())
+            return
 
     if data == "w:cancel":
         _pending.pop(chat_id, None)
